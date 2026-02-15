@@ -1,0 +1,204 @@
+#!/usr/bin/env python3
+"""
+generate_terragrunt_readme.py
+
+Generates a README.md for the *current folder* containing terragrunt.hcl.
+
+- Reads:
+  - terragrunt.hcl
+  - any *.hcl in the current folder (optional)
+- Extracts:
+  - terraform.source (module URL)
+  - include blocks
+  - locals (names only)
+  - inputs keys + literal values (best-effort)
+- Writes:
+  - README.md in the same folder
+
+Notes:
+- This is designed for Azure DevOps pipeline deployments (not local terragrunt usage).
+- This is a lightweight parser (regex-based) to avoid extra deps.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import sys
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, List, Tuple, Optional
+
+
+def read_text(p: Path) -> str:
+    return p.read_text(encoding="utf-8")
+
+
+def find_first(regex: str, text: str, flags=0) -> Optional[str]:
+    m = re.search(regex, text, flags)
+    return m.group(1) if m else None
+
+
+def parse_source(hcl: str) -> Optional[str]:
+    # terraform { source = "..." }
+    return find_first(r'(?s)\bterraform\s*\{.*?\bsource\s*=\s*"([^"]+)"', hcl)
+
+
+def parse_includes(hcl: str) -> List[str]:
+    # include "root" { ... } -> root
+    return re.findall(r'\binclude\s+"([^"]+)"\s*\{', hcl)
+
+
+def parse_locals_names(hcl: str) -> List[str]:
+    # locals { a = ..., b = ... }
+    block = find_first(r'(?s)\blocals\s*\{(.*?)\n\}', hcl)
+    if not block:
+        return []
+    names = re.findall(r'(?m)^\s*([A-Za-z0-9_]+)\s*=', block)
+    # unique, preserve order
+    seen = set()
+    out = []
+    for n in names:
+        if n not in seen:
+            out.append(n)
+            seen.add(n)
+    return out
+
+
+def parse_inputs(hcl: str) -> Dict[str, str]:
+    """
+    Best-effort parse of:
+      inputs = { key = value ... }
+
+    This is not a full HCL parser, but works well for typical Terragrunt.
+    """
+    block = find_first(r'(?s)\binputs\s*=\s*\{(.*?)\n\}', hcl)
+    if not block:
+        return {}
+
+    inputs: Dict[str, str] = {}
+
+    # Match top-level key = value lines (doesn't handle nested maps perfectly)
+    for line in block.splitlines():
+        line = line.strip()
+        if not line or line.startswith("#"):
+            continue
+        # skip closing braces for nested blocks
+        if line in ["}", "},"]:
+            continue
+
+        m = re.match(r'^([A-Za-z0-9_]+)\s*=\s*(.+?)\s*$', line)
+        if not m:
+            continue
+
+        k = m.group(1)
+        v = m.group(2).rstrip(",")
+
+        # compact long values
+        if len(v) > 90:
+            v = v[:87] + "..."
+
+        inputs[k] = v
+
+    return inputs
+
+
+def detect_stack_name(folder: Path, hcl_source: Optional[str]) -> str:
+    # Use folder name by default, but try to infer from module name
+    if hcl_source:
+        # azure-module-XYZ
+        m = re.search(r'/_git/([^/]+)//', hcl_source)
+        if m:
+            return folder.name + f" ({m.group(1)})"
+    return folder.name
+
+
+def generate_readme(
+    folder: Path,
+    source: Optional[str],
+    includes: List[str],
+    locals_names: List[str],
+    inputs: Dict[str, str],
+) -> str:
+    now = datetime.utcnow().strftime("%Y-%m-%d %H:%M UTC")
+
+    title = f"# {folder.name}\n"
+
+    overview = (
+        "## Overview\n"
+        "This folder contains a Terragrunt stack deployed via **Azure DevOps pipelines**.\n"
+        "It is intended to be applied at subscription scope (unless stated otherwise).\n\n"
+    )
+
+    module = "## Terraform module source\n"
+    module += f"- **Source:** `{source or 'Not detected'}`\n\n"
+
+    scope = (
+        "## Scope\n"
+        "- **Environment:** non-prod (inferred)\n"
+        "- **Region:** UK South (if `location = \"uksouth\"` is set)\n"
+        "- **Deployment method:** Azure DevOps pipeline\n\n"
+    )
+
+    inc = "## Terragrunt includes\n"
+    if includes:
+        for i in includes:
+            inc += f"- `{i}`\n"
+    else:
+        inc += "- None detected\n"
+    inc += "\n"
+
+    locs = "## Locals\n"
+    if locals_names:
+        locs += "This stack defines the following local variables:\n\n"
+        for n in locals_names:
+            locs += f"- `{n}`\n"
+    else:
+        locs += "- No locals detected\n"
+    locs += "\n"
+
+    inp = "## Inputs\n"
+    if inputs:
+        inp += "| Name | Value (from terragrunt.hcl) |\n"
+        inp += "|------|----------------------------|\n"
+        for k in sorted(inputs.keys()):
+            inp += f"| `{k}` | `{inputs[k]}` |\n"
+        inp += "\n"
+    else:
+        inp += "- No inputs detected\n\n"
+
+    notes = (
+        "## Notes\n"
+        "- This stack is expected to be deployed by pipeline (no local `terragrunt apply` required).\n"
+        "- If this stack creates backup vaults / RSVs, remember:\n"
+        "  - VM backups require a vault **in the same subscription** as the VM.\n"
+        "  - Azure Backup Center provides central visibility across subscriptions.\n\n"
+    )
+
+    footer = f"---\nGenerated by `generate_terragrunt_readme.py` on {now}\n"
+
+    return title + overview + module + scope + inc + locs + inp + notes + footer
+
+
+def main():
+    folder = Path.cwd()
+    tg = folder / "terragrunt.hcl"
+    if not tg.exists():
+        print("ERROR: terragrunt.hcl not found in current folder.", file=sys.stderr)
+        sys.exit(2)
+
+    hcl = read_text(tg)
+
+    source = parse_source(hcl)
+    includes = parse_includes(hcl)
+    locals_names = parse_locals_names(hcl)
+    inputs = parse_inputs(hcl)
+
+    out = generate_readme(folder, source, includes, locals_names, inputs)
+    (folder / "README.md").write_text(out, encoding="utf-8")
+
+    print(f"README.md written to: {folder / 'README.md'}")
+
+
+if __name__ == "__main__":
+    main()
