@@ -7,8 +7,8 @@ Confluence Cloud MCP Server (Claude Code compatible)
 - Auth: Atlassian email + API token (Basic auth)
 
 You will set env vars before adding the MCP server:
-  export CONFLUENCE_BASE_URL="https://osbgroup.atlassian.net"
-  export CONFLUENCE_EMAIL="your.name@osbgroup.co.uk"
+  export CONFLUENCE_BASE_URL="https://group.atlassian.net"
+  export CONFLUENCE_EMAIL="your.name@group.co.uk"
   export CONFLUENCE_API_TOKEN="ATATT3xFf...."
 
 Add to Claude Code:
